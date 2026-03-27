@@ -85,17 +85,22 @@ def _curl_get(url: str) -> dict:
 # Phase 0 — Check resolution of previous window (Martingale input)
 # ---------------------------------------------------------------------------
 
-def check_resolution(coin: str, prev_ts: int,
-                     max_attempts: int = 10, delay: int = 5) -> Optional[str]:
-    """
-    Returns the winning outcome ("Up" or "Down") for the previous 5-min window,
-    or None if it couldn't be determined after max_attempts.
-    Retries because the market may not have settled yet.
-    """
-    slug = f"{coin}-updown-5m-{prev_ts}"
-    url  = f"{GAMMA_API}/events/slug/{slug}"
+RESOLVE_TIMEOUT = 120  # seconds — Polymarket resolution can take 1-2 min after window close
 
-    for attempt in range(1, max_attempts + 1):
+
+def check_resolution(coin: str, prev_ts: int, delay: int = 5) -> Optional[str]:
+    """
+    Polls until the previous window resolves (outcomePrices hits 1.0) or
+    RESOLVE_TIMEOUT seconds elapse.  Returns winning outcome or None.
+    """
+    slug     = f"{coin}-updown-5m-{prev_ts}"
+    url      = f"{GAMMA_API}/events/slug/{slug}"
+    deadline = time.monotonic() + RESOLVE_TIMEOUT
+    attempt  = 0
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.monotonic())
         try:
             event      = _curl_get(url)
             market     = (event.get("markets") or [{}])[0]
@@ -106,40 +111,46 @@ def check_resolution(coin: str, prev_ts: int,
 
             for i, price_str in enumerate(prices):
                 if float(price_str) >= 0.99 and i < len(outcomes):
-                    print(f"  [{coin.upper()}] Prev window resolved → {outcomes[i]}")
+                    print(f"  [{coin.upper()}] Resolved → {outcomes[i]} (attempt {attempt})")
                     return outcomes[i]
 
-            print(f"  [{coin.upper()}] Not resolved yet ({attempt}/{max_attempts})")
+            print(f"  [{coin.upper()}] Not resolved yet, {remaining}s left …")
         except Exception as exc:
-            print(f"  [{coin.upper()}] Resolution check error: {exc} ({attempt}/{max_attempts})")
+            print(f"  [{coin.upper()}] Resolution error: {exc}, {remaining}s left …")
 
-        if attempt < max_attempts:
+        if time.monotonic() < deadline:
             time.sleep(delay)
 
-    print(f"  [{coin.upper()}] Could not determine resolution after {max_attempts} attempts")
+    print(f"  [{coin.upper()}] Timed out after {RESOLVE_TIMEOUT}s — skipping Martingale update")
     return None
 
 
 def resolve_all_previous(app_state: dict, prev_ts: int) -> None:
-    """Parallel resolution check for all coins; update Martingale state."""
+    """
+    Blocking: parallel resolution check for all coins that bet last cycle.
+    Waits up to RESOLVE_TIMEOUT seconds per coin (coins run concurrently).
+    Updates Martingale state before returning — callers must not proceed
+    to Phase 1 until this returns.
+    """
+    coins_to_check = [
+        coin for coin in COINS
+        if app_state.get("coins", {}).get(coin, {}).get("last_slug")
+        == f"{coin}-updown-5m-{prev_ts}"
+    ]
+    if not coins_to_check:
+        return
+
     def _resolve(coin: str) -> None:
-        prev_slug  = f"{coin}-updown-5m-{prev_ts}"
-        coin_state = app_state.get("coins", {}).get(coin, {})
-
-        # Only check if we actually bet on this coin last cycle
-        if coin_state.get("last_slug") != prev_slug:
-            return
-
-        bet    = coin_state.get("current_bet", BASE_BET)
+        bet    = app_state["coins"][coin].get("current_bet", BASE_BET)
         winner = check_resolution(coin, prev_ts)
         if winner is None:
             return
-
         st.apply_result(app_state, coin, BASE_BET, MAX_BET,
-                        prev_slug, bet, winner == DIRECTION, winner)
+                        f"{coin}-updown-5m-{prev_ts}", bet,
+                        winner == DIRECTION, winner)
 
-    with ThreadPoolExecutor(max_workers=len(COINS)) as pool:
-        futures = [pool.submit(_resolve, coin) for coin in COINS]
+    with ThreadPoolExecutor(max_workers=len(coins_to_check)) as pool:
+        futures = [pool.submit(_resolve, coin) for coin in coins_to_check]
         for f in as_completed(futures):
             exc = f.exception()
             if exc:
@@ -308,21 +319,17 @@ def run_cycle(client: ClobClient, app_state: dict) -> None:
     for coin in COINS:
         st.ensure_coin(app_state, coin, BASE_BET)
 
-    # --- Phase 0: Resolve previous window in background (doesn't block Phase 1-3) ---
+    # --- Phase 0: Resolve previous window (BLOCKING — bet size depends on result) ---
     has_prev = any(
         app_state["coins"].get(coin, {}).get("last_slug") ==
         f"{coin}-updown-5m-{prev_ts}"
         for coin in COINS
     )
     if has_prev:
-        print(f"\n[Phase 0] Resolving previous window (ts={prev_ts}) in background …")
+        print(f"\n[Phase 0] Resolving previous window (ts={prev_ts}) — up to {RESOLVE_TIMEOUT}s …")
         st.add_log(app_state, f"Phase 0: resolving window ts={prev_ts}")
-        threading.Thread(
-            target=resolve_all_previous,
-            args=(app_state, prev_ts),
-            daemon=True,
-            name=f"resolve-{prev_ts}",
-        ).start()
+        resolve_all_previous(app_state, prev_ts)
+        print(f"[Phase 0] Done.")
 
     # --- Phase 1: Fetch open market per coin (parallel) ---
     print(f"\n[Phase 1] Fetching open markets (parallel, ts={ts}) …")
