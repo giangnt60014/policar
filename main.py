@@ -110,22 +110,21 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
 
 def fetch_coin_market(coin: str, ts: int, max_attempts: int = 3, delay: int = 15) -> Optional[dict]:
     """
-    Fetch the current open market for one coin.
-    Tries current window (ts) then next window (ts+300).
-    Retries up to max_attempts times if not found yet.
+    Fetch the current open market for one coin using the exact window timestamp.
+    Retries up to max_attempts times if the market isn't live yet.
     """
+    slug = f"{coin}-updown-5m-{ts}"
+    url  = f"{GAMMA_API}/events/slug/{slug}"
+
     for attempt in range(1, max_attempts + 1):
-        for window_ts in (ts, ts + 300):
-            slug = f"{coin}-updown-5m-{window_ts}"
-            url  = f"{GAMMA_API}/events/slug/{slug}"
-            try:
-                event = _curl_get(url)
-                result = _extract_market(event, coin)
-                if result:
-                    print(f"  [{coin.upper()}] Found: {slug}")
-                    return result
-            except (RuntimeError, ValueError, json.JSONDecodeError):
-                pass
+        try:
+            event  = _curl_get(url)
+            result = _extract_market(event, coin)
+            if result:
+                print(f"  [{coin.upper()}] Found: {slug}")
+                return result
+        except (RuntimeError, ValueError, json.JSONDecodeError):
+            pass
 
         if attempt < max_attempts:
             print(f"  [{coin.upper()}] Not found (attempt {attempt}/{max_attempts}), retrying in {delay}s …")
