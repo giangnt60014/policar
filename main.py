@@ -210,7 +210,7 @@ def post_orders_with_retry(
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_cycle() -> None:
+def run_cycle(client: ClobClient) -> None:
     ts      = current_window_timestamp()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*60}")
@@ -228,16 +228,8 @@ def run_cycle() -> None:
 
     print(f"  Ready  : {[m['slug'] for m in markets]}")
 
-    # --- Phase 2: Initialize CLOB client (3 attempts, 5s apart) ---
-    print("\n[Phase 2] Initializing CLOB client …")
-    try:
-        client = build_client()
-    except RuntimeError as exc:
-        print(f"  {exc}. Skipping cycle.")
-        return
-
-    # --- Phase 3: Sign all orders in parallel (local, no network) ---
-    print(f"\n[Phase 3] Signing {len(markets)} order(s) in parallel …")
+    # --- Phase 2: Sign all orders in parallel (local, no network) ---
+    print(f"\n[Phase 2] Signing {len(markets)} order(s) in parallel …")
     signed: list[tuple[str, PostOrdersArgs]] = []
 
     with ThreadPoolExecutor(max_workers=len(markets)) as pool:
@@ -251,10 +243,10 @@ def run_cycle() -> None:
         print("No orders signed successfully. Skipping submission.")
         return
 
-    # --- Phase 4: Submit ALL signed orders in ONE batch call ---
+    # --- Phase 3: Submit ALL signed orders in ONE batch call ---
     labels = [coin.upper() for coin, _ in signed]
     batch  = [args for _, args in signed]
-    print(f"\n[Phase 4] Batch submitting {len(batch)} order(s): {', '.join(labels)}")
+    print(f"\n[Phase 3] Batch submitting {len(batch)} order(s): {', '.join(labels)}")
     post_orders_with_retry(client, batch, labels)
 
 
@@ -271,12 +263,16 @@ def main() -> None:
     if not FUNDER:
         sys.exit("Error: FUNDER not set in .env")
 
+    print("Initializing CLOB client …")
+    client = build_client()
+    print("Client ready.\n")
+
     while True:
         trigger = next_trigger_time()
         wait    = (trigger - datetime.now(timezone.utc)).total_seconds()
         print(f"Next trigger : {trigger.strftime('%H:%M:%S UTC')}  (in {wait:.1f}s)")
         time.sleep(max(0, wait))
-        run_cycle()
+        run_cycle(client)
 
 
 if __name__ == "__main__":
