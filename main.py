@@ -5,10 +5,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderType, PostOrdersArgs
 from py_clob_client.constants import POLYGON
 from py_clob_client.order_builder.constants import BUY
 
@@ -70,7 +71,6 @@ def _curl_get(url: str) -> dict:
 
 def get_market(slug: str) -> dict:
     data = _curl_get(f"{GAMMA_API}/events/slug/{slug}")
-    # events endpoint returns a list of markets under "markets" key
     markets = data.get("markets") if isinstance(data, dict) else None
     if not markets:
         raise ValueError("Event not found or has no markets")
@@ -94,7 +94,78 @@ def get_market_with_retry(slug: str, max_attempts: int = 3, delay: int = 15) -> 
 
 
 # ---------------------------------------------------------------------------
-# Order placement (with retry)
+# Phase 1 — parallel: fetch market + sign order (no network for signing)
+# ---------------------------------------------------------------------------
+
+def fetch_and_sign(
+    client: ClobClient,
+    coin: str,
+    ts: int,
+) -> Optional[tuple[str, PostOrdersArgs]]:
+    """
+    Fetch the market for one coin and sign a market order locally.
+    Returns (coin, PostOrdersArgs) on success, or None if the coin should be skipped.
+    Does NOT submit anything to the exchange.
+    """
+    slug  = f"{coin}-updown-5m-{ts}"
+    label = coin.upper()
+
+    try:
+        market = get_market_with_retry(slug)
+    except ValueError as exc:
+        print(f"  [{label}] Skipping — {exc}")
+        return None
+
+    question  = market.get("question") or slug
+    raw_ids   = market.get("clobTokenIds", "[]")
+    raw_out   = market.get("outcomes", "[]")
+    token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+    outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
+
+    token_id = None
+    for i, outcome in enumerate(outcomes):
+        if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
+            token_id = token_ids[i]
+            break
+
+    if not token_id:
+        print(f"  [{label}] No token for direction '{DIRECTION}'. Outcomes: {outcomes}")
+        return None
+
+    print(f"  [{label}] {question}")
+    print(f"  [{label}] Signing BUY {DIRECTION} — ${ORDER_AMOUNT} USDC  (token …{token_id[-8:]})")
+
+    order_args   = MarketOrderArgs(token_id=token_id, amount=ORDER_AMOUNT, side=BUY)
+    signed_order = client.create_market_order(order_args)
+
+    return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.FOK)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — single call: submit all signed orders in one request (with retry)
+# ---------------------------------------------------------------------------
+
+def post_orders_with_retry(
+    client: ClobClient,
+    batch: list[PostOrdersArgs],
+    labels: list[str],
+    max_attempts: int = 3,
+) -> None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"\nSubmitting {len(batch)} order(s) in one call (attempt {attempt}/{max_attempts}) …")
+            response = client.post_orders(batch)
+            print(f"Batch response: {response}")
+            return
+        except Exception as exc:
+            print(f"Batch attempt {attempt} failed: {exc}")
+            if attempt < max_attempts:
+                time.sleep(2)
+    print(f"All {max_attempts} batch attempts failed. Giving up.")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
 # ---------------------------------------------------------------------------
 
 def build_client() -> ClobClient:
@@ -108,65 +179,6 @@ def build_client() -> ClobClient:
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
-
-def place_order_with_retry(
-    client: ClobClient,
-    token_id: str,
-    label: str,
-    max_attempts: int = 3,
-) -> None:
-    for attempt in range(1, max_attempts + 1):
-        try:
-            print(f"  [{label}] Placing order (attempt {attempt}/{max_attempts}) …")
-            order_args   = MarketOrderArgs(token_id=token_id, amount=ORDER_AMOUNT, side=BUY)
-            market_order = client.create_market_order(order_args)
-            response     = client.post_order(market_order, OrderType.FOK)
-            print(f"  [{label}] Order placed. Response: {response}")
-            return
-        except Exception as exc:
-            print(f"  [{label}] Order attempt {attempt} failed: {exc}")
-            if attempt < max_attempts:
-                time.sleep(2)
-    print(f"  [{label}] All {max_attempts} order attempts failed. Giving up.")
-
-
-def trade_coin(client: ClobClient, coin: str, ts: int) -> None:
-    """Full pipeline for one coin: fetch market → resolve token → place order."""
-    slug  = f"{coin}-updown-5m-{ts}"
-    label = coin.upper()
-
-    try:
-        market = get_market_with_retry(slug)
-    except ValueError as exc:
-        print(f"  [{label}] Skipping — {exc}")
-        return
-
-    question  = market.get("question") or slug
-    raw_ids   = market.get("clobTokenIds", "[]")
-    raw_out   = market.get("outcomes", "[]")
-    token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-    outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
-
-    # Match configured direction to the correct token_id
-    token_id = None
-    for i, outcome in enumerate(outcomes):
-        if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
-            token_id = token_ids[i]
-            break
-
-    if not token_id:
-        print(f"  [{label}] No token for direction '{DIRECTION}'. Outcomes: {outcomes}")
-        return
-
-    print(f"  [{label}] {question}")
-    print(f"  [{label}] BUY {DIRECTION} — ${ORDER_AMOUNT} USDC  (token …{token_id[-8:]})")
-
-    place_order_with_retry(client, token_id, label)
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
 
 def run_cycle() -> None:
     ts      = current_window_timestamp()
@@ -183,10 +195,13 @@ def run_cycle() -> None:
         print(f"Client init failed: {exc}")
         return
 
-    # Run each coin in parallel — search + order are fully isolated per coin
+    # --- Phase 1: fetch all markets + sign all orders in parallel ---
+    print(f"\nFetching markets & signing orders in parallel …")
+    signed: list[tuple[str, PostOrdersArgs]] = []
+
     with ThreadPoolExecutor(max_workers=len(COINS)) as pool:
         futures = {
-            pool.submit(trade_coin, client, coin, ts): coin
+            pool.submit(fetch_and_sign, client, coin, ts): coin
             for coin in COINS
         }
         for future in as_completed(futures):
@@ -194,6 +209,20 @@ def run_cycle() -> None:
             exc  = future.exception()
             if exc:
                 print(f"  [{coin.upper()}] Unexpected error: {exc}")
+                continue
+            result = future.result()
+            if result:
+                signed.append(result)
+
+    if not signed:
+        print("No orders to submit.")
+        return
+
+    # --- Phase 2: submit all signed orders in ONE network call ---
+    labels = [coin.upper() for coin, _ in signed]
+    batch  = [args for _, args in signed]
+    print(f"\nReady to submit: {', '.join(labels)}")
+    post_orders_with_retry(client, batch, labels)
 
 
 def main() -> None:
