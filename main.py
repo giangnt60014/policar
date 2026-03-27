@@ -66,23 +66,35 @@ def _curl_get(url: str) -> list | dict:
 
 def fetch_current_markets() -> list[dict]:
     """
-    Single API call: GET all active 5M up-or-down events tagged with '5M' and 'up-or-down'.
-    Returns only events matching configured COINS (closed=false is sufficient to get current window).
+    Single API call: GET all active 5M up-or-down events.
+    Events are sorted by endDate ascending — the earliest endDate IS the current live window.
+    We keep only events from that first window, then filter by configured COINS.
 
     Each returned dict: { coin, slug, question, token_id }
     """
     url = (
         f"{GAMMA_API}/events"
         f"?tag_slug=5M&tag_slug=up-or-down"
-        f"&active=true&closed=false&limit=50"
+        f"&active=true&closed=false"
+        f"&order=endDate&ascending=true&limit=50"
     )
     events = _curl_get(url)
     if not isinstance(events, list):
         raise ValueError(f"Unexpected API response shape: {type(events)}")
 
+    if not events:
+        return []
+
+    # All events in the current window share the same endDate — grab it from the first event
+    current_window_end = events[0].get("endDate", "")
+
     matched = []
 
     for event in events:
+        # Stop as soon as we've passed the current window
+        if event.get("endDate", "") != current_window_end:
+            break
+
         slug        = event.get("slug", "")
         series_slug = event.get("seriesSlug", "")
 
