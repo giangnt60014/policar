@@ -1,12 +1,13 @@
 import json
 import os
-import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from curl_cffi.requests import Session
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderType, PostOrdersArgs
@@ -27,12 +28,6 @@ MAX_BET        = float(os.environ.get("MAX_BET", "64"))
 COINS          = {c.strip().lower() for c in os.environ.get("COINS", "btc").split(",")}
 DIRECTION      = os.environ.get("DIRECTION", "Up")  # "Up" or "Down"
 
-CURL_HEADERS = [
-    "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "-H", "Accept: application/json",
-    "-H", "Accept-Language: en-US,en;q=0.9",
-    "-H", "Referer: https://polymarket.com/",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -58,17 +53,19 @@ def next_trigger_time() -> datetime:
 # Curl helper
 # ---------------------------------------------------------------------------
 
+# Per-thread persistent Session — reuses TLS connection, avoids Cloudflare resets
+_thread_local = threading.local()
+
+def _get_session() -> Session:
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = Session(impersonate="chrome120")
+    return _thread_local.session
+
+
 def _curl_get(url: str) -> dict:
-    result = subprocess.run(
-        ["curl", "-s", "--compressed", "--max-time", "10"] + CURL_HEADERS + [url],
-        capture_output=True, text=True, timeout=15,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"curl exited {result.returncode}: {result.stderr.strip()}")
-    raw = result.stdout.strip()
-    if not raw:
-        raise ValueError("Empty response from API")
-    return json.loads(raw)
+    resp = _get_session().get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
