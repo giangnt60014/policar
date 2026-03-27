@@ -108,7 +108,7 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
     }
 
 
-def fetch_coin_market(coin: str, ts: int, max_attempts: int = 3, delay: int = 15) -> Optional[dict]:
+def fetch_coin_market(coin: str, ts: int, max_attempts: int = 3, delay: int = 5) -> Optional[dict]:
     """
     Fetch the current open market for one coin using the exact window timestamp.
     Retries up to max_attempts times if the market isn't live yet.
@@ -169,19 +169,22 @@ def build_client(max_attempts: int = 3, delay: int = 5) -> ClobClient:
     raise RuntimeError(f"CLOB client init failed after {max_attempts} attempts")
 
 
-def sign_order(client: ClobClient, market: dict) -> Optional[tuple[str, PostOrdersArgs]]:
+def sign_order(client: ClobClient, market: dict, max_attempts: int = 3, delay: int = 5) -> Optional[tuple[str, PostOrdersArgs]]:
     """Sign one market order locally (no network). Returns (coin, PostOrdersArgs) or None."""
     coin     = market["coin"]
     token_id = market["token_id"]
     label    = coin.upper()
-    try:
-        order_args   = MarketOrderArgs(token_id=token_id, amount=ORDER_AMOUNT, side=BUY)
-        signed_order = client.create_market_order(order_args)
-        print(f"  [{label}] Signed BUY {DIRECTION} ${ORDER_AMOUNT} USDC  (token …{token_id[-8:]})")
-        return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.FOK)
-    except Exception as exc:
-        print(f"  [{label}] Signing failed: {exc}")
-        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            order_args   = MarketOrderArgs(token_id=token_id, amount=ORDER_AMOUNT, side=BUY)
+            signed_order = client.create_market_order(order_args)
+            print(f"  [{label}] Signed BUY {DIRECTION} ${ORDER_AMOUNT} USDC  (token …{token_id[-8:]})")
+            return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.FOK)
+        except Exception as exc:
+            print(f"  [{label}] Signing attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                time.sleep(delay)
+    return None
 
 
 def post_orders_with_retry(
@@ -201,7 +204,7 @@ def post_orders_with_retry(
         except Exception as exc:
             print(f"Batch attempt {attempt} failed: {exc}")
             if attempt < max_attempts:
-                time.sleep(2)
+                time.sleep(5)
     print(f"All {max_attempts} batch attempts failed.")
 
 
