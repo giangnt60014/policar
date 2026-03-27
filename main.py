@@ -1,133 +1,189 @@
 import json
 import os
+import subprocess
 import sys
-import requests
+import time
+from datetime import datetime, timedelta, timezone
+
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderType, MarketOrderArgs
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
 
-HOST = "https://clob.polymarket.com"
+HOST      = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-PK = os.environ.get("PK")
-FUNDER = os.environ.get("FUNDER")
-ORDER_AMOUNT = float(os.environ.get("ORDER_AMOUNT", "10"))
+PK           = os.environ.get("PK")
+FUNDER       = os.environ.get("FUNDER")
+ORDER_AMOUNT = float(os.environ.get("ORDER_AMOUNT", "2"))
+COINS        = [c.strip().lower() for c in os.environ.get("COINS", "btc").split(",")]
+DIRECTION    = os.environ.get("DIRECTION", "Up")  # "Up" or "Down"
+
+CURL_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-}
+# ---------------------------------------------------------------------------
+# Timing helpers
+# ---------------------------------------------------------------------------
+
+def current_window_timestamp() -> int:
+    """Floor current UTC time to the nearest 5-minute boundary → unix timestamp."""
+    now = datetime.now(timezone.utc)
+    floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    return int(floored.timestamp())
 
 
-def get_market_by_slug(slug: str) -> dict:
-    resp = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, headers=HEADERS, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data:
-        raise ValueError(f"No market found for slug: {slug!r}")
-    return data[0]
+def next_trigger_time() -> datetime:
+    """Return the next xx:x0:10 or xx:x5:10 UTC moment."""
+    now = datetime.now(timezone.utc)
+    floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    trigger = floored + timedelta(seconds=10)
+    if trigger <= now:
+        trigger += timedelta(minutes=5)
+    return trigger
 
+
+# ---------------------------------------------------------------------------
+# Market lookup via subprocess curl (bypasses Cloudflare TLS fingerprinting)
+# ---------------------------------------------------------------------------
+
+def _curl_get(url: str) -> dict:
+    result = subprocess.run(
+        ["curl", "-s", "--max-time", "10", "-A", CURL_UA, url],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"curl exited {result.returncode}: {result.stderr.strip()}")
+    raw = result.stdout.strip()
+    if not raw:
+        raise ValueError("Empty response from API")
+    return json.loads(raw)
+
+
+def get_market(slug: str) -> dict:
+    data = _curl_get(f"{GAMMA_API}/markets/slug/{slug}")
+    if not data or not data.get("clobTokenIds"):
+        raise ValueError("Market not found or has no tokens")
+    return data
+
+
+def get_market_with_retry(slug: str, max_attempts: int = 3, delay: int = 15) -> dict:
+    for attempt in range(1, max_attempts + 1):
+        print(f"    [{attempt}/{max_attempts}] GET /markets/slug/{slug}")
+        try:
+            return get_market(slug)
+        except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
+            print(f"    Not ready: {exc}")
+            if attempt < max_attempts:
+                print(f"    Retrying in {delay}s …")
+                time.sleep(delay)
+    raise ValueError(f"Market '{slug}' unavailable after {max_attempts} attempts")
+
+
+# ---------------------------------------------------------------------------
+# Order placement
+# ---------------------------------------------------------------------------
 
 def build_client() -> ClobClient:
-    if not PK:
-        sys.exit("Error: PK not set in .env")
-    if not FUNDER:
-        sys.exit("Error: FUNDER not set in .env")
-
     client = ClobClient(
         HOST,
         key=PK,
         chain_id=POLYGON,
-        signature_type=1,   # Email / Magic wallet (delegated signing)
+        signature_type=1,   # Email / Magic wallet delegated signing
         funder=FUNDER,
     )
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
 
-def main():
-    print("=== Policar — Polymarket Order Bot ===")
-    print(f"Signature type : 1 (Email/Magic wallet)")
-    print(f"Funder address : {FUNDER}")
-    print(f"Order amount   : ${ORDER_AMOUNT} USDC")
-    print()
+def trade_coin(client: ClobClient, coin: str, ts: int) -> None:
+    slug = f"{coin}-updown-5m-{ts}"
+    print(f"\n  [{coin.upper()}] slug: {slug}")
 
-    # --- Wait for slug input ---
-    slug = input("Enter market slug: ").strip()
-    if not slug:
-        sys.exit("No slug entered. Exiting.")
-
-    # --- Resolve slug → tokens ---
-    print(f"\nLooking up market '{slug}'...")
     try:
-        market = get_market_by_slug(slug)
-    except (ValueError, RuntimeError, requests.RequestException) as e:
-        sys.exit(f"Error: {e}")
+        market = get_market_with_retry(slug)
+    except ValueError as exc:
+        print(f"  [{coin.upper()}] Skipping — {exc}")
+        return
 
-    question = market.get("question") or market.get("title") or slug
-
-    raw_ids = market.get("clobTokenIds", "[]")
-    raw_outcomes = market.get("outcomes", "[]")
+    question  = market.get("question") or slug
+    raw_ids   = market.get("clobTokenIds", "[]")
+    raw_out   = market.get("outcomes", "[]")
     token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-    outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+    outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
 
-    if not token_ids:
-        sys.exit("Error: Market has no token IDs. It may be resolved or unavailable.")
-
-    tokens = [{"outcome": outcomes[i] if i < len(outcomes) else f"Token {i}",
-               "token_id": token_ids[i]} for i in range(len(token_ids))]
-
-    print(f"\nMarket: {question}")
-    print()
-    for i, token in enumerate(tokens):
-        print(f"  [{i}] {token['outcome']:10s}  token_id: {token['token_id']}")
-
-    # --- Select outcome ---
-    print()
-    choice_raw = input("Select outcome index [0]: ").strip() or "0"
-    try:
-        choice = int(choice_raw)
-        selected = tokens[choice]
-    except (ValueError, IndexError):
-        sys.exit(f"Invalid selection: {choice_raw!r}")
-
-    token_id = selected["token_id"]
-    outcome = selected["outcome"]
+    # Match configured direction to the correct token_id
+    token_id = None
+    for i, outcome in enumerate(outcomes):
+        if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
+            token_id = token_ids[i]
+            break
 
     if not token_id:
-        sys.exit("Error: Selected token has no token_id.")
+        print(f"  [{coin.upper()}] No token for direction '{DIRECTION}'. Outcomes: {outcomes}")
+        return
 
-    # --- Confirm ---
-    print(f"\nAbout to place:")
-    print(f"  Market  : {question}")
-    print(f"  Outcome : {outcome}")
-    print(f"  Side    : BUY")
-    print(f"  Amount  : ${ORDER_AMOUNT} USDC")
-    print(f"  Type    : FOK (Fill or Kill)")
-    confirm = input("\nProceed? [y/N]: ").strip().lower()
-    if confirm not in ("y", "yes"):
-        sys.exit("Cancelled.")
+    print(f"  [{coin.upper()}] {question}")
+    print(f"  [{coin.upper()}] BUY {DIRECTION} — ${ORDER_AMOUNT} USDC  (token …{token_id[-8:]})")
 
-    # --- Build client & place order ---
-    print("\nInitializing client and signing credentials...")
-    client = build_client()
-
-    order_args = MarketOrderArgs(
-        token_id=token_id,
-        amount=ORDER_AMOUNT,
-        side=BUY,
-    )
+    order_args   = MarketOrderArgs(token_id=token_id, amount=ORDER_AMOUNT, side=BUY)
     market_order = client.create_market_order(order_args)
+    response     = client.post_order(market_order, OrderType.FOK)
+    print(f"  [{coin.upper()}] Response: {response}")
 
-    print("Submitting order...")
-    response = client.post_order(market_order, OrderType.FOK)
 
-    print(f"\nOrder response: {response}")
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_cycle() -> None:
+    ts = current_window_timestamp()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"\n{'='*60}")
+    print(f"Cycle  : {now_str}")
+    print(f"Window : {ts}  |  Direction: {DIRECTION}  |  Amount: ${ORDER_AMOUNT} USDC")
+    print(f"Coins  : {', '.join(c.upper() for c in COINS)}")
+
+    print("\nInitializing CLOB client …")
+    try:
+        client = build_client()
+    except Exception as exc:
+        print(f"Client init failed: {exc}")
+        return
+
+    for coin in COINS:
+        try:
+            trade_coin(client, coin, ts)
+        except Exception as exc:
+            print(f"  [{coin.upper()}] Unexpected error: {exc}")
+
+
+def main() -> None:
+    print("=== Policar — Polymarket 5-min Bot ===")
+    print(f"Coins     : {', '.join(c.upper() for c in COINS)}")
+    print(f"Direction : {DIRECTION}")
+    print(f"Amount    : ${ORDER_AMOUNT} USDC per coin")
+    print(f"Funder    : {FUNDER}")
+    print()
+
+    if not PK:
+        sys.exit("Error: PK not set in .env")
+    if not FUNDER:
+        sys.exit("Error: FUNDER not set in .env")
+
+    while True:
+        trigger = next_trigger_time()
+        wait    = (trigger - datetime.now(timezone.utc)).total_seconds()
+        print(f"Next trigger : {trigger.strftime('%H:%M:%S UTC')}  (in {wait:.1f}s)")
+        time.sleep(max(0, wait))
+        run_cycle()
 
 
 if __name__ == "__main__":

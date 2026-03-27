@@ -1,3 +1,2 @@
 py-clob-client
 python-dotenv
-requests
