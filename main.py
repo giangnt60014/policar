@@ -219,7 +219,7 @@ def fetch_coin_market(coin: str, ts: int,
                 print(f"  [{coin.upper()}] Found: {slug}")
                 return result
             print(f"  [{coin.upper()}] Market exists but no usable token ({attempt}/{max_attempts})")
-        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        except Exception as exc:
             print(f"  [{coin.upper()}] Error ({attempt}/{max_attempts}): {exc}")
 
         if attempt < max_attempts:
@@ -235,9 +235,13 @@ def fetch_all_markets(ts: int) -> list[dict]:
         futures = {pool.submit(fetch_coin_market, coin, ts): coin for coin in COINS}
         results = []
         for future in as_completed(futures):
-            r = future.result()
-            if r:
-                results.append(r)
+            coin = futures[future]
+            try:
+                r = future.result()
+                if r:
+                    results.append(r)
+            except Exception as exc:
+                print(f"  [{coin.upper()}] Fetch thread crashed: {exc}")
     return results
 
 
