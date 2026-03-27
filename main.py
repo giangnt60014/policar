@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -36,6 +36,13 @@ CURL_HEADERS = [
 # Timing helpers
 # ---------------------------------------------------------------------------
 
+def current_window_timestamp() -> int:
+    """Floor current UTC time to the nearest 5-minute boundary → unix timestamp."""
+    now = datetime.now(timezone.utc)
+    floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    return int(floored.timestamp())
+
+
 def next_trigger_time() -> datetime:
     """Return the next xx:x0:10 or xx:x5:10 UTC moment."""
     now = datetime.now(timezone.utc)
@@ -47,13 +54,13 @@ def next_trigger_time() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Market discovery — ONE API call for all coins
+# Market discovery — per-coin slug lookup, parallel
 # ---------------------------------------------------------------------------
 
-def _curl_get(url: str) -> list | dict:
-    """Fetch a URL via subprocess curl with gzip support (bypasses Cloudflare TLS fingerprinting)."""
+def _curl_get(url: str) -> dict:
+    """Fetch a URL via subprocess curl (bypasses Cloudflare TLS fingerprinting)."""
     result = subprocess.run(
-        ["curl", "-s", "--compressed", "--max-time", "10"] + CURL_HEADERS + [url],
+        ["curl", "-s", "--max-time", "10"] + CURL_HEADERS + [url],
         capture_output=True, text=True, timeout=15,
     )
     if result.returncode != 0:
@@ -64,105 +71,84 @@ def _curl_get(url: str) -> list | dict:
     return json.loads(raw)
 
 
-def fetch_current_markets() -> list[dict]:
+def _extract_market(event: dict, coin: str) -> Optional[dict]:
     """
-    Single API call: GET all active 5M up-or-down events.
-    Events are sorted by endDate ascending — the earliest endDate IS the current live window.
-    We keep only events from that first window, then filter by configured COINS.
-
-    Each returned dict: { coin, slug, question, token_id }
+    Given an event dict from /events/slug/..., extract market info.
+    Returns { coin, slug, question, token_id } or None if unusable.
     """
-    url = (
-        f"{GAMMA_API}/events"
-        f"?tag_slug=5M&tag_slug=up-or-down"
-        f"&active=true&closed=false"
-        f"&order=endDate&ascending=true&limit=50"
-    )
-    events = _curl_get(url)
-    if not isinstance(events, list):
-        raise ValueError(f"Unexpected API response shape: {type(events)}")
+    now_utc  = datetime.now(timezone.utc)
+    end_date = event.get("endDate", "")
+    if end_date:
+        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        if end_dt <= now_utc:
+            return None   # already ended
 
-    if not events:
-        return []
+    slug   = event.get("slug", "")
+    market = (event.get("markets") or [{}])[0]
 
-    # All events in the current window share the same endDate — grab it from the first event
-    current_window_end = events[0].get("endDate", "")
+    raw_ids   = market.get("clobTokenIds", "[]")
+    raw_out   = market.get("outcomes", "[]")
+    token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+    outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
 
-    matched = []
-
-    for event in events:
-        # Stop as soon as we've passed the current window
-        if event.get("endDate", "") != current_window_end:
+    token_id = None
+    for i, outcome in enumerate(outcomes):
+        if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
+            token_id = token_ids[i]
             break
 
-        slug        = event.get("slug", "")
-        series_slug = event.get("seriesSlug", "")
+    if not token_id:
+        return None
 
-        # Derive coin name: "btc-up-or-down-5m" → "btc"
-        coin = series_slug.replace("-up-or-down-5m", "").lower()
-        if coin not in COINS:
-            continue
-
-        market    = (event.get("markets") or [{}])[0]
-        raw_ids   = market.get("clobTokenIds", "[]")
-        raw_out   = market.get("outcomes", "[]")
-        token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-        outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
-
-        # Match configured direction → token_id
-        token_id = None
-        for i, outcome in enumerate(outcomes):
-            if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
-                token_id = token_ids[i]
-                break
-
-        if not token_id:
-            print(f"  [{coin.upper()}] No token for direction '{DIRECTION}'. Outcomes: {outcomes}")
-            continue
-
-        matched.append({
-            "coin":     coin,
-            "slug":     slug,
-            "question": market.get("question") or slug,
-            "token_id": token_id,
-        })
-
-    return matched
+    return {
+        "coin":     coin,
+        "slug":     slug,
+        "question": market.get("question") or slug,
+        "token_id": token_id,
+    }
 
 
-def fetch_current_markets_with_retry(
-    max_attempts: int = 3,
-    delay: int = 15,
-) -> list[dict]:
-    """Retry fetching until all configured COINS appear in the response."""
+def fetch_coin_market(coin: str, ts: int, max_attempts: int = 3, delay: int = 15) -> Optional[dict]:
+    """
+    Fetch the current open market for one coin.
+    Tries current window (ts) then next window (ts+300).
+    Retries up to max_attempts times if not found yet.
+    """
     for attempt in range(1, max_attempts + 1):
-        print(f"  Attempt {attempt}/{max_attempts} — querying tag_slug=5M&up-or-down …")
-        try:
-            markets = fetch_current_markets()
-            found_coins = {m["coin"] for m in markets}
-            missing     = COINS - found_coins
-            if markets and not missing:
-                return markets
-            if markets and missing:
-                print(f"  Found {[m['coin'].upper() for m in markets]}, missing: {[c.upper() for c in missing]}")
-            else:
-                print(f"  No markets found yet.")
-        except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
-            print(f"  API error: {exc}")
+        for window_ts in (ts, ts + 300):
+            slug = f"{coin}-updown-5m-{window_ts}"
+            url  = f"{GAMMA_API}/events/slug/{slug}"
+            try:
+                event = _curl_get(url)
+                result = _extract_market(event, coin)
+                if result:
+                    print(f"  [{coin.upper()}] Found: {slug}")
+                    return result
+            except (RuntimeError, ValueError, json.JSONDecodeError):
+                pass
 
         if attempt < max_attempts:
-            print(f"  Retrying in {delay}s …")
+            print(f"  [{coin.upper()}] Not found (attempt {attempt}/{max_attempts}), retrying in {delay}s …")
             time.sleep(delay)
 
-    # Return whatever we managed to find on last attempt (partial is better than nothing)
-    try:
-        return fetch_current_markets()
-    except Exception:
-        return []
+    print(f"  [{coin.upper()}] No open market found after {max_attempts} attempts. Skipping.")
+    return None
+
+
+def fetch_all_markets(ts: int) -> list[dict]:
+    """Fetch open markets for all configured COINS in parallel."""
+    results = []
+    with ThreadPoolExecutor(max_workers=len(COINS)) as pool:
+        futures = {pool.submit(fetch_coin_market, coin, ts): coin for coin in COINS}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                results.append(result)
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Order signing (parallel, local — no network) + batch submission
+# Order signing (parallel, local) + batch submission
 # ---------------------------------------------------------------------------
 
 def build_client() -> ClobClient:
@@ -198,13 +184,13 @@ def post_orders_with_retry(
     labels: list[str],
     max_attempts: int = 3,
 ) -> None:
-    """Submit all signed orders in ONE POST /orders call, with up to 3 retries."""
+    """Submit all signed orders in ONE batch call, with up to 3 retries."""
     for attempt in range(1, max_attempts + 1):
         try:
             print(f"\nSubmitting {len(batch)} order(s) [{', '.join(labels)}]"
                   f" — attempt {attempt}/{max_attempts} …")
             response = client.post_orders(batch)
-            print(f"Batch response: {response}")
+            print(f"Batch response: {json.dumps(response, indent=2)}")
             return
         except Exception as exc:
             print(f"Batch attempt {attempt} failed: {exc}")
@@ -218,23 +204,24 @@ def post_orders_with_retry(
 # ---------------------------------------------------------------------------
 
 def run_cycle() -> None:
+    ts      = current_window_timestamp()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*60}")
-    print(f"Cycle  : {now_str}")
-    print(f"Direction: {DIRECTION}  |  Amount: ${ORDER_AMOUNT} USDC")
-    print(f"Coins  : {', '.join(sorted(c.upper() for c in COINS))}")
+    print(f"Cycle    : {now_str}")
+    print(f"Window ts: {ts}  |  Direction: {DIRECTION}  |  Amount: ${ORDER_AMOUNT} USDC")
+    print(f"Coins    : {', '.join(sorted(c.upper() for c in COINS))}")
 
-    # --- Phase 1: ONE API call → all open markets for configured coins ---
-    print(f"\n[Phase 1] Fetching all active 5M up-or-down markets …")
-    markets = fetch_current_markets_with_retry()
+    # --- Phase 1: fetch open market per coin in parallel ---
+    print(f"\n[Phase 1] Fetching open markets (parallel) …")
+    markets = fetch_all_markets(ts)
 
     if not markets:
         print("No markets found. Skipping cycle.")
         return
 
-    print(f"  Found: {[m['slug'] for m in markets]}")
+    print(f"  Ready  : {[m['slug'] for m in markets]}")
 
-    # --- Phase 2: Initialize client ---
+    # --- Phase 2: Initialize CLOB client ---
     print("\n[Phase 2] Initializing CLOB client …")
     try:
         client = build_client()
