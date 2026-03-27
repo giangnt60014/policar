@@ -36,13 +36,6 @@ CURL_HEADERS = [
 # Timing helpers
 # ---------------------------------------------------------------------------
 
-def current_window_timestamp() -> int:
-    """Floor current UTC time to the nearest 5-minute boundary → unix timestamp."""
-    now = datetime.now(timezone.utc)
-    floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    return int(floored.timestamp())
-
-
 def next_trigger_time() -> datetime:
     """Return the next xx:x0:10 or xx:x5:10 UTC moment."""
     now = datetime.now(timezone.utc)
@@ -71,10 +64,10 @@ def _curl_get(url: str) -> list | dict:
     return json.loads(raw)
 
 
-def fetch_current_markets(ts: int) -> list[dict]:
+def fetch_current_markets() -> list[dict]:
     """
     Single API call: GET all active 5M up-or-down events tagged with '5M' and 'up-or-down'.
-    Returns only events matching the current window timestamp AND configured COINS.
+    Returns only events matching configured COINS (closed=false is sufficient to get current window).
 
     Each returned dict: { coin, slug, question, token_id }
     """
@@ -87,16 +80,11 @@ def fetch_current_markets(ts: int) -> list[dict]:
     if not isinstance(events, list):
         raise ValueError(f"Unexpected API response shape: {type(events)}")
 
-    ts_suffix = f"-{ts}"
     matched = []
 
     for event in events:
         slug        = event.get("slug", "")
         series_slug = event.get("seriesSlug", "")
-
-        # Must belong to the current 5-minute window
-        if not slug.endswith(ts_suffix):
-            continue
 
         # Derive coin name: "btc-up-or-down-5m" → "btc"
         coin = series_slug.replace("-up-or-down-5m", "").lower()
@@ -131,15 +119,14 @@ def fetch_current_markets(ts: int) -> list[dict]:
 
 
 def fetch_current_markets_with_retry(
-    ts: int,
     max_attempts: int = 3,
     delay: int = 15,
 ) -> list[dict]:
-    """Retry fetching until all configured COINS have a market for this window."""
+    """Retry fetching until all configured COINS appear in the response."""
     for attempt in range(1, max_attempts + 1):
-        print(f"  Attempt {attempt}/{max_attempts} — querying tag_slug=5M&up-or-down (ts={ts}) …")
+        print(f"  Attempt {attempt}/{max_attempts} — querying tag_slug=5M&up-or-down …")
         try:
-            markets = fetch_current_markets(ts)
+            markets = fetch_current_markets()
             found_coins = {m["coin"] for m in markets}
             missing     = COINS - found_coins
             if markets and not missing:
@@ -147,7 +134,7 @@ def fetch_current_markets_with_retry(
             if markets and missing:
                 print(f"  Found {[m['coin'].upper() for m in markets]}, missing: {[c.upper() for c in missing]}")
             else:
-                print(f"  No markets found for window ts={ts} yet.")
+                print(f"  No markets found yet.")
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             print(f"  API error: {exc}")
 
@@ -157,7 +144,7 @@ def fetch_current_markets_with_retry(
 
     # Return whatever we managed to find on last attempt (partial is better than nothing)
     try:
-        return fetch_current_markets(ts)
+        return fetch_current_markets()
     except Exception:
         return []
 
@@ -219,16 +206,15 @@ def post_orders_with_retry(
 # ---------------------------------------------------------------------------
 
 def run_cycle() -> None:
-    ts      = current_window_timestamp()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*60}")
     print(f"Cycle  : {now_str}")
-    print(f"Window : {ts}  |  Direction: {DIRECTION}  |  Amount: ${ORDER_AMOUNT} USDC")
+    print(f"Direction: {DIRECTION}  |  Amount: ${ORDER_AMOUNT} USDC")
     print(f"Coins  : {', '.join(sorted(c.upper() for c in COINS))}")
 
-    # --- Phase 1: ONE API call → all markets for current window + configured coins ---
+    # --- Phase 1: ONE API call → all open markets for configured coins ---
     print(f"\n[Phase 1] Fetching all active 5M up-or-down markets …")
-    markets = fetch_current_markets_with_retry(ts)
+    markets = fetch_current_markets_with_retry()
 
     if not markets:
         print("No markets found. Skipping cycle.")
