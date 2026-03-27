@@ -175,7 +175,7 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
 
 
 def fetch_coin_market(coin: str, ts: int,
-                      max_attempts: int = 3, delay: int = 5) -> Optional[dict]:
+                      max_attempts: int = 5, delay: int = 6) -> Optional[dict]:
     slug = f"{coin}-updown-5m-{ts}"
     url  = f"{GAMMA_API}/events/slug/{slug}"
 
