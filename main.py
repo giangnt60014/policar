@@ -62,10 +62,23 @@ def _get_session() -> Session:
     return _thread_local.session
 
 
+def _reset_session() -> Session:
+    _thread_local.session = Session(impersonate="chrome120")
+    return _thread_local.session
+
+
 def _curl_get(url: str) -> dict:
-    resp = _get_session().get(url, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(2):
+        try:
+            resp = _get_session().get(url, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            # libcurl error 35 = SSL connect error — recreate session and retry once
+            if "35" in str(exc) and attempt == 0:
+                _reset_session()
+                continue
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -295,16 +308,21 @@ def run_cycle(client: ClobClient, app_state: dict) -> None:
     for coin in COINS:
         st.ensure_coin(app_state, coin, BASE_BET)
 
-    # --- Phase 0: Resolve previous window & update Martingale state ---
+    # --- Phase 0: Resolve previous window in background (doesn't block Phase 1-3) ---
     has_prev = any(
         app_state["coins"].get(coin, {}).get("last_slug") ==
         f"{coin}-updown-5m-{prev_ts}"
         for coin in COINS
     )
     if has_prev:
-        print(f"\n[Phase 0] Resolving previous window (ts={prev_ts}) …")
+        print(f"\n[Phase 0] Resolving previous window (ts={prev_ts}) in background …")
         st.add_log(app_state, f"Phase 0: resolving window ts={prev_ts}")
-        resolve_all_previous(app_state, prev_ts)
+        threading.Thread(
+            target=resolve_all_previous,
+            args=(app_state, prev_ts),
+            daemon=True,
+            name=f"resolve-{prev_ts}",
+        ).start()
 
     # --- Phase 1: Fetch open market per coin (parallel) ---
     print(f"\n[Phase 1] Fetching open markets (parallel, ts={ts}) …")
