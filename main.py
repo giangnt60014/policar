@@ -60,7 +60,7 @@ def next_trigger_time() -> datetime:
 
 def _curl_get(url: str) -> dict:
     result = subprocess.run(
-        ["curl", "-s", "--max-time", "10"] + CURL_HEADERS + [url],
+        ["curl", "-s", "--compressed", "--max-time", "10"] + CURL_HEADERS + [url],
         capture_output=True, text=True, timeout=15,
     )
     if result.returncode != 0:
@@ -186,11 +186,12 @@ def fetch_coin_market(coin: str, ts: int,
             if result:
                 print(f"  [{coin.upper()}] Found: {slug}")
                 return result
-        except (RuntimeError, ValueError, json.JSONDecodeError):
-            pass
+            print(f"  [{coin.upper()}] Market exists but no usable token ({attempt}/{max_attempts})")
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"  [{coin.upper()}] Error ({attempt}/{max_attempts}): {exc}")
 
         if attempt < max_attempts:
-            print(f"  [{coin.upper()}] Not found ({attempt}/{max_attempts}), retrying in {delay}s …")
+            print(f"  [{coin.upper()}] Retrying in {delay}s …")
             time.sleep(delay)
 
     print(f"  [{coin.upper()}] No open market found after {max_attempts} attempts. Skipping.")
