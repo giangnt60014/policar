@@ -163,6 +163,9 @@ def resolve_all_previous(app_state: dict, prev_ts: int) -> None:
 # Phase 1 — Market discovery (per-coin slug, parallel)
 # ---------------------------------------------------------------------------
 
+MAX_PRICE = 0.60  # skip if our direction's token costs more than this
+
+
 def _extract_market(event: dict, coin: str) -> Optional[dict]:
     now_utc  = datetime.now(timezone.utc)
     end_date = event.get("endDate", "")
@@ -171,20 +174,28 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
         if end_dt <= now_utc:
             return None
 
-    slug     = event.get("slug", "")
-    market   = (event.get("markets") or [{}])[0]
-    raw_ids  = market.get("clobTokenIds", "[]")
-    raw_out  = market.get("outcomes", "[]")
-    token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-    outcomes  = json.loads(raw_out)  if isinstance(raw_out,  str) else raw_out
+    slug      = event.get("slug", "")
+    market    = (event.get("markets") or [{}])[0]
+    raw_ids   = market.get("clobTokenIds", "[]")
+    raw_out   = market.get("outcomes", "[]")
+    raw_prices = market.get("outcomePrices", "[]")
+    token_ids  = json.loads(raw_ids)    if isinstance(raw_ids,    str) else raw_ids
+    outcomes   = json.loads(raw_out)    if isinstance(raw_out,    str) else raw_out
+    prices     = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
 
     token_id = None
+    price    = None
     for i, outcome in enumerate(outcomes):
         if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
             token_id = token_ids[i]
+            price    = float(prices[i]) if i < len(prices) else None
             break
 
     if not token_id:
+        return None
+
+    if price is not None and price > MAX_PRICE:
+        print(f"  [{coin.upper()}] Price {price:.3f} > {MAX_PRICE} — skipping")
         return None
 
     return {
@@ -192,6 +203,7 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
         "slug":     slug,
         "question": market.get("question") or slug,
         "token_id": token_id,
+        "price":    price,
     }
 
 
@@ -319,31 +331,38 @@ def run_cycle(client: ClobClient, app_state: dict) -> None:
     for coin in COINS:
         st.ensure_coin(app_state, coin, BASE_BET)
 
-    # --- Phase 0: Resolve previous window (BLOCKING — bet size depends on result) ---
+    # --- Phase 0 + Phase 1 run concurrently ---
+    # Phase 0: resolve previous window (need result before signing)
+    # Phase 1: fetch open markets (pure network, independent of Phase 0)
+    # Phase 2+3 wait until Phase 0 is done to get correct bet sizes.
+
     has_prev = any(
         app_state["coins"].get(coin, {}).get("last_slug") ==
         f"{coin}-updown-5m-{prev_ts}"
         for coin in COINS
     )
-    if has_prev:
-        print(f"\n[Phase 0] Resolving previous window (ts={prev_ts}) — up to {RESOLVE_TIMEOUT}s …")
-        st.add_log(app_state, f"Phase 0: resolving window ts={prev_ts}")
-        resolve_all_previous(app_state, prev_ts)
-        print(f"[Phase 0] Done.")
 
-    # --- Phase 1: Fetch open market per coin (parallel) ---
-    print(f"\n[Phase 1] Fetching open markets (parallel, ts={ts}) …")
-    st.add_log(app_state, f"Phase 1: fetching markets ts={ts}")
+    print(f"\n[Phase 0+1] Running resolution check and market fetch in parallel …")
+    st.add_log(app_state, f"Phase 0+1: ts={ts} prev_ts={prev_ts}")
     st.save(app_state)
 
-    markets = fetch_all_markets(ts)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        phase0_future = pool.submit(resolve_all_previous, app_state, prev_ts) \
+                        if has_prev else None
+        phase1_future = pool.submit(fetch_all_markets, ts)
+
+        markets = phase1_future.result()           # wait for Phase 1
+        if phase0_future is not None:
+            phase0_future.result()                 # wait for Phase 0 (blocks Phase 2+3)
+            print("[Phase 0] Done.")
+
+    print(f"[Phase 1] Ready: {[m['slug'] for m in markets]}")
+
     if not markets:
-        print("No markets found. Skipping cycle.")
+        print("[Phase 1] No markets found. Skipping cycle.")
         st.add_log(app_state, "No markets found — skipped")
         st.save(app_state)
         return
-
-    print(f"  Ready: {[m['slug'] for m in markets]}")
 
     # --- Phase 2: Sign orders in parallel (local, no network) ---
     print(f"\n[Phase 2] Signing {len(markets)} order(s) in parallel …")
