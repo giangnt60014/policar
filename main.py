@@ -151,16 +151,23 @@ def fetch_all_markets(ts: int) -> list[dict]:
 # Order signing (parallel, local) + batch submission
 # ---------------------------------------------------------------------------
 
-def build_client() -> ClobClient:
-    client = ClobClient(
-        HOST,
-        key=PK,
-        chain_id=POLYGON,
-        signature_type=1,   # Email / Magic wallet delegated signing
-        funder=FUNDER,
-    )
-    client.set_api_creds(client.create_or_derive_api_creds())
-    return client
+def build_client(max_attempts: int = 3, delay: int = 5) -> ClobClient:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = ClobClient(
+                HOST,
+                key=PK,
+                chain_id=POLYGON,
+                signature_type=1,   # Email / Magic wallet delegated signing
+                funder=FUNDER,
+            )
+            client.set_api_creds(client.create_or_derive_api_creds())
+            return client
+        except Exception as exc:
+            print(f"  Client init attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                time.sleep(delay)
+    raise RuntimeError(f"CLOB client init failed after {max_attempts} attempts")
 
 
 def sign_order(client: ClobClient, market: dict) -> Optional[tuple[str, PostOrdersArgs]]:
@@ -221,12 +228,12 @@ def run_cycle() -> None:
 
     print(f"  Ready  : {[m['slug'] for m in markets]}")
 
-    # --- Phase 2: Initialize CLOB client ---
+    # --- Phase 2: Initialize CLOB client (3 attempts, 5s apart) ---
     print("\n[Phase 2] Initializing CLOB client …")
     try:
         client = build_client()
-    except Exception as exc:
-        print(f"Client init failed: {exc}")
+    except RuntimeError as exc:
+        print(f"  {exc}. Skipping cycle.")
         return
 
     # --- Phase 3: Sign all orders in parallel (local, no network) ---
