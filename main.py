@@ -163,7 +163,15 @@ def resolve_all_previous(app_state: dict, prev_ts: int) -> None:
 # Phase 1 — Market discovery (per-coin slug, parallel)
 # ---------------------------------------------------------------------------
 
-MAX_PRICE = 0.60  # skip if our direction's token costs more than this
+MAX_PRICE = 0.60  # skip if live BUY price > this
+
+
+def get_live_price(token_id: str) -> Optional[float]:
+    """Fetch current BUY price from the CLOB order book (live, not Gamma cache)."""
+    url = f"{HOST}/price?token_id={token_id}&side=BUY"
+    data = _curl_get(url)
+    raw = data.get("price")
+    return float(raw) if raw is not None else None
 
 
 def _extract_market(event: dict, coin: str) -> Optional[dict]:
@@ -178,24 +186,16 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
     market    = (event.get("markets") or [{}])[0]
     raw_ids   = market.get("clobTokenIds", "[]")
     raw_out   = market.get("outcomes", "[]")
-    raw_prices = market.get("outcomePrices", "[]")
-    token_ids  = json.loads(raw_ids)    if isinstance(raw_ids,    str) else raw_ids
-    outcomes   = json.loads(raw_out)    if isinstance(raw_out,    str) else raw_out
-    prices     = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+    token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+    outcomes  = json.loads(raw_out) if isinstance(raw_out, str) else raw_out
 
     token_id = None
-    price    = None
     for i, outcome in enumerate(outcomes):
         if outcome.strip().lower() == DIRECTION.lower() and i < len(token_ids):
             token_id = token_ids[i]
-            price    = float(prices[i]) if i < len(prices) else None
             break
 
     if not token_id:
-        return None
-
-    if price is not None and price > MAX_PRICE:
-        print(f"  [{coin.upper()}] Price {price:.3f} > {MAX_PRICE} — skipping")
         return None
 
     return {
@@ -203,7 +203,6 @@ def _extract_market(event: dict, coin: str) -> Optional[dict]:
         "slug":     slug,
         "question": market.get("question") or slug,
         "token_id": token_id,
-        "price":    price,
     }
 
 
@@ -272,9 +271,16 @@ def sign_order(client: ClobClient, market: dict, bet: float,
 
     for attempt in range(1, max_attempts + 1):
         try:
+            # Check live CLOB price before signing
+            live_price = get_live_price(token_id)
+            if live_price is not None and live_price > MAX_PRICE:
+                print(f"  [{label}] Live price {live_price:.3f} > {MAX_PRICE} — skipping")
+                return None
+
             order_args   = MarketOrderArgs(token_id=token_id, amount=bet, side=BUY)
             signed_order = client.create_market_order(order_args)
-            print(f"  [{label}] Signed BUY {DIRECTION} ${bet:.2f} USDC (token …{token_id[-8:]})")
+            price_str    = f" @ ${live_price:.3f}" if live_price is not None else ""
+            print(f"  [{label}] Signed BUY {DIRECTION} ${bet:.2f} USDC{price_str} (token …{token_id[-8:]})")
             return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.FOK)
         except Exception as exc:
             print(f"  [{label}] Sign attempt {attempt}/{max_attempts} failed: {exc}")
