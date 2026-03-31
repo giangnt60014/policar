@@ -10,7 +10,7 @@ from typing import Optional
 from curl_cffi.requests import Session
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType, PostOrdersArgs
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, PostOrdersArgs
 from py_clob_client.constants import POLYGON
 from py_clob_client.order_builder.constants import BUY
 from web3 import Web3
@@ -319,8 +319,11 @@ def post_orders_with_retry(client: ClobClient, batch: list[PostOrdersArgs],
 
 
 # ---------------------------------------------------------------------------
-# Martingale strategy — sign (single direction, with price cap)
+# Martingale strategy — GTC limit order at live_price + 0.02 (capped at MAX_PRICE)
 # ---------------------------------------------------------------------------
+
+LIMIT_SLIPPAGE = 0.02   # buffer above current ask to ensure fill
+
 
 def sign_order(client: ClobClient, market: dict, bet: float,
                max_attempts: int = 5, delay: int = 5) -> Optional[tuple[str, PostOrdersArgs]]:
@@ -331,14 +334,24 @@ def sign_order(client: ClobClient, market: dict, bet: float,
     for attempt in range(1, max_attempts + 1):
         try:
             live_price = get_live_price(token_id)
-            if live_price is not None and live_price > MAX_PRICE:
+
+            if live_price is None:
+                print(f"  [{label}] Could not fetch live price — skipping")
+                return None
+            if live_price > MAX_PRICE:
                 print(f"  [{label}] Live price {live_price:.3f} > {MAX_PRICE} — skipping")
                 return None
-            order_args   = MarketOrderArgs(token_id=token_id, amount=bet, side=BUY)
-            signed_order = client.create_market_order(order_args)
-            price_str    = f" @ ${live_price:.3f}" if live_price is not None else ""
-            print(f"  [{label}] Martingale: signed BUY {DIRECTION} ${bet:.2f}{price_str}")
-            return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.FOK)
+
+            # GTC limit order: pad above current ask so it fills immediately
+            # but won't chase the price beyond MAX_PRICE
+            limit_price  = round(min(live_price + LIMIT_SLIPPAGE, MAX_PRICE), 2)
+            size         = round(bet / limit_price, 2)   # size in tokens
+
+            order_args   = OrderArgs(token_id=token_id, price=limit_price, size=size, side=BUY)
+            signed_order = client.create_order(order_args)
+            print(f"  [{label}] Martingale: GTC BUY {DIRECTION} "
+                  f"{size} tokens @ {limit_price:.2f} (ask={live_price:.3f}  bet=${bet:.2f})")
+            return coin, PostOrdersArgs(order=signed_order, orderType=OrderType.GTC)
         except Exception as exc:
             print(f"  [{label}] Sign attempt {attempt}/{max_attempts} failed: {exc}")
             if attempt < max_attempts:
