@@ -3,15 +3,14 @@ Policar Dashboard — simple Flask web UI.
 Run alongside main.py: python3 dashboard.py
 Reads state.json written by the bot; auto-refreshes every 5s.
 """
-import json
 import os
 
 from flask import Flask, jsonify, Response
 
 import state as st
 
-app   = Flask(__name__)
-PORT  = int(os.environ.get("DASHBOARD_PORT", "8080"))
+app  = Flask(__name__)
+PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -31,6 +30,7 @@ HTML = """<!DOCTYPE html>
     --yellow:   #eab308;
     --blue:     #3b82f6;
     --accent:   #6366f1;
+    --purple:   #a855f7;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
@@ -56,10 +56,10 @@ HTML = """<!DOCTYPE html>
 
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 12px; }
 
-  .coins-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+  .coins-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
   .coin-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px;
-    display: flex; flex-direction: column; gap: 14px;
+    display: flex; flex-direction: column; gap: 12px;
   }
   .coin-header { display: flex; align-items: center; justify-content: space-between; }
   .coin-name { font-size: 18px; font-weight: 700; letter-spacing: 1px; }
@@ -70,17 +70,36 @@ HTML = """<!DOCTYPE html>
   .result-loss { background: rgba(239,68,68,.15);  color: var(--red); }
   .result-none { background: rgba(100,116,139,.15); color: var(--muted); }
 
+  .price-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 10px; background: rgba(255,255,255,.03); border-radius: 6px;
+  }
+  .price-label { color: var(--muted); font-size: 11px; }
+  .price-value { font-weight: 700; font-size: 13px; color: var(--blue); }
+
+  /* Strategy section divider */
+  .strategy-section { display: flex; flex-direction: column; gap: 10px; }
+  .strategy-header {
+    display: flex; align-items: center; justify-content: space-between;
+    border-top: 1px solid var(--border); padding-top: 10px; margin-top: 2px;
+  }
+  .strategy-label {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700;
+  }
+  .strategy-label.martingale { color: var(--accent); }
+  .strategy-label.follower   { color: var(--purple); }
+
   .stat-row { display: flex; justify-content: space-between; }
   .stat-label { color: var(--muted); }
   .stat-value { font-weight: 600; }
-  .stat-value.bet    { color: var(--yellow); }
+  .stat-value.bet        { color: var(--yellow); }
   .stat-value.streak-pos { color: var(--green); }
   .stat-value.streak-neg { color: var(--red); }
+  .stat-value.direction-up   { color: var(--green); }
+  .stat-value.direction-down { color: var(--red); }
 
-  .history-dots { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-  .dot {
-    width: 10px; height: 10px; border-radius: 50%;
-  }
+  .history-dots { display: flex; gap: 4px; flex-wrap: wrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
   .dot-win  { background: var(--green); }
   .dot-loss { background: var(--red); }
 
@@ -132,8 +151,16 @@ async function refresh() {
   }
 }
 
+function fmtPrice(val) {
+  if (val == null) return '—';
+  return '$' + Number(val).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+}
+
 function render(data) {
   const bot = data.bot || {};
+  const strategy = (bot.strategy || 'martingale').toLowerCase();
+  const showMartingale = strategy === 'martingale' || strategy === 'both';
+  const showFollower   = strategy === 'follower'   || strategy === 'both';
 
   // Status pill
   const pill = document.getElementById('status-pill');
@@ -146,73 +173,121 @@ function render(data) {
   }
 
   // Meta bar
-  const meta = document.getElementById('meta-bar');
-  meta.innerHTML = [
-    ['Direction', bot.direction || '—'],
-    ['Base Bet',  bot.base_bet ? `$${bot.base_bet}` : '—'],
-    ['Max Bet',   bot.max_bet  ? `$${bot.max_bet}`  : '—'],
-    ['Last Cycle', bot.last_cycle || '—'],
+  const metaItems = [
+    ['Strategy',     (bot.strategy || '—').toUpperCase()],
+    ['Direction',    bot.direction   || '—'],
+    ['Base Bet',     bot.base_bet    ? `$${bot.base_bet}` : '—'],
+    ['Max Bet',      bot.max_bet     ? `$${bot.max_bet}`  : '—'],
+    ['Follower Bet', bot.follower_bet ? `$${bot.follower_bet}` : '—'],
+    ['Last Cycle',   bot.last_cycle  || '—'],
     ['Next Trigger', bot.next_trigger || '—'],
-  ].map(([label, value]) => `
+  ];
+  document.getElementById('meta-bar').innerHTML = metaItems.map(([label, value]) => `
     <div class="meta-item">
       <span class="meta-label">${label}</span>
       <span class="meta-value">${value}</span>
     </div>`).join('');
 
   // Coins
-  const grid = document.getElementById('coins-grid');
+  const grid  = document.getElementById('coins-grid');
   const coins = data.coins || {};
   grid.innerHTML = Object.entries(coins).sort().map(([coin, cs]) => {
-    const streak = cs.streak || 0;
-    const streakClass = streak > 0 ? 'streak-pos' : streak < 0 ? 'streak-neg' : '';
+    const fol = cs.follower || {};
+
+    // Martingale stats
+    const streak    = cs.streak || 0;
+    const streakCls = streak > 0 ? 'streak-pos' : streak < 0 ? 'streak-neg' : '';
     const streakStr = streak > 0 ? `+${streak} 🔥` : streak < 0 ? `${streak} 🧊` : '—';
-    const resultClass = cs.last_result === 'win' ? 'result-win' : cs.last_result === 'loss' ? 'result-loss' : 'result-none';
-    const resultLabel = cs.last_result || 'pending';
-
-    const dots = (cs.history || []).slice(0, 15).map(h =>
-      `<div class="dot dot-${h.result}" title="${h.slug}: ${h.result} (bet $${h.bet})"></div>`
+    const mWL  = (cs.wins || 0) + (cs.losses || 0);
+    const mPct = mWL > 0 ? Math.round((cs.wins || 0) / mWL * 100) : 0;
+    const mDots = (cs.history || []).slice(0, 15).map(h =>
+      `<div class="dot dot-${h.result}" title="${h.slug}: ${h.result} bet=$${h.bet}"></div>`
     ).join('');
+    const mResultCls = cs.last_result === 'win' ? 'result-win' : cs.last_result === 'loss' ? 'result-loss' : 'result-none';
 
-    const wl = (cs.wins || 0) + (cs.losses || 0);
-    const pct = wl > 0 ? Math.round((cs.wins / wl) * 100) : 0;
+    // Follower stats
+    const fWL  = (fol.wins || 0) + (fol.losses || 0);
+    const fPct = fWL > 0 ? Math.round((fol.wins || 0) / fWL * 100) : 0;
+    const fDots = (fol.history || []).slice(0, 15).map(h =>
+      `<div class="dot dot-${h.result}" title="${h.slug}: ${h.result} dir=${h.direction}"></div>`
+    ).join('');
+    const fResultCls = fol.last_result === 'win' ? 'result-win' : fol.last_result === 'loss' ? 'result-loss' : 'result-none';
+    const fDirCls = fol.last_direction === 'Up' ? 'direction-up' : fol.last_direction === 'Down' ? 'direction-down' : '';
+
+    // Top badge: prefer martingale if running, else follower
+    const topResultCls   = showMartingale ? mResultCls : fResultCls;
+    const topResultLabel = showMartingale
+      ? (cs.last_result || 'pending')
+      : (fol.last_result || 'pending');
+
+    // Martingale section (only if strategy includes it)
+    const martingaleSection = showMartingale ? `
+      <div class="strategy-section">
+        <div class="strategy-header">
+          <span class="strategy-label martingale">MARTINGALE</span>
+          <span class="result-badge ${mResultCls}">${cs.last_result || 'pending'}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Next Bet</span>
+          <span class="stat-value bet">$${(cs.current_bet || 0).toFixed(2)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Streak</span>
+          <span class="stat-value ${streakCls}">${streakStr}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">W / L</span>
+          <span class="stat-value">${cs.wins || 0} / ${cs.losses || 0} <span style="color:var(--muted)">(${mPct}%)</span></span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Total Spent</span>
+          <span class="stat-value">$${(cs.total_spent || 0).toFixed(2)}</span>
+        </div>
+        <div class="history-dots">${mDots}</div>
+      </div>` : '';
+
+    // Follower section (only if strategy includes it)
+    const followerSection = showFollower ? `
+      <div class="strategy-section">
+        <div class="strategy-header">
+          <span class="strategy-label follower">FOLLOWER</span>
+          <span class="result-badge ${fResultCls}">${fol.last_result || 'pending'}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Last Direction</span>
+          <span class="stat-value ${fDirCls}">${fol.last_direction || '—'}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">W / L</span>
+          <span class="stat-value">${fol.wins || 0} / ${fol.losses || 0} <span style="color:var(--muted)">(${fPct}%)</span></span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Total Spent</span>
+          <span class="stat-value">$${(fol.total_spent || 0).toFixed(2)}</span>
+        </div>
+        <div class="history-dots">${fDots}</div>
+      </div>` : '';
 
     return `
     <div class="coin-card">
       <div class="coin-header">
         <span class="coin-name">${coin.toUpperCase()}</span>
-        <span class="result-badge ${resultClass}">${resultLabel}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Price to Beat</span>
-        <span class="stat-value">${cs.price_to_beat != null ? '$' + cs.price_to_beat.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '—'}</span>
+      <div class="price-row">
+        <span class="price-label">Price to Beat</span>
+        <span class="price-value">${fmtPrice(cs.price_to_beat)}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Close Price</span>
-        <span class="stat-value">${cs.close_price != null ? '$' + cs.close_price.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '—'}</span>
+      <div class="price-row">
+        <span class="price-label">Close Price</span>
+        <span class="price-value">${fmtPrice(cs.close_price)}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Next Bet</span>
-        <span class="stat-value bet">$${(cs.current_bet || 0).toFixed(2)}</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Streak</span>
-        <span class="stat-value ${streakClass}">${streakStr}</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">W / L</span>
-        <span class="stat-value">${cs.wins || 0} / ${cs.losses || 0} &nbsp;<span style="color:var(--muted)">(${pct}%)</span></span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Total Spent</span>
-        <span class="stat-value">$${(cs.total_spent || 0).toFixed(2)}</span>
-      </div>
-      <div class="history-dots">${dots}</div>
+      ${martingaleSection}
+      ${followerSection}
     </div>`;
   }).join('');
 
   // Log
-  const logList = document.getElementById('log-list');
-  logList.innerHTML = (data.log || []).map(entry =>
+  document.getElementById('log-list').innerHTML = (data.log || []).map(entry =>
     `<div class="log-entry"><span class="log-time">${entry.time}</span><span class="log-msg">${entry.msg}</span></div>`
   ).join('');
 }

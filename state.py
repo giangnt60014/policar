@@ -13,14 +13,29 @@ _lock = threading.Lock()
 
 def _default_coin(base_bet: float) -> dict:
     return {
+        # --- Martingale fields ---
         "current_bet": base_bet,
-        "streak": 0,           # >0 win streak, <0 loss streak
-        "last_result": None,   # "win" | "loss" | None
-        "last_slug": None,
-        "wins": 0,
-        "losses": 0,
+        "streak":      0,           # >0 win streak, <0 loss streak
+        "last_result": None,        # "win" | "loss" | None
+        "last_slug":   None,
+        "wins":        0,
+        "losses":      0,
         "total_spent": 0.0,
-        "history": [],         # last 20 entries
+        "history":     [],          # last 20 entries
+        # --- Follower sub-dict ---
+        "follower": _default_follower(),
+    }
+
+
+def _default_follower() -> dict:
+    return {
+        "last_result":    None,   # "win" | "loss" | None
+        "last_direction": None,   # "Up" | "Down" — what was bought
+        "last_slug":      None,
+        "wins":           0,
+        "losses":         0,
+        "total_spent":    0.0,
+        "history":        [],     # last 20 entries
     }
 
 
@@ -45,6 +60,9 @@ def ensure_coin(state: dict, coin: str, base_bet: float) -> None:
     state.setdefault("coins", {})
     if coin not in state["coins"]:
         state["coins"][coin] = _default_coin(base_bet)
+    else:
+        # Backfill follower sub-dict for existing state.json entries
+        state["coins"][coin].setdefault("follower", _default_follower())
 
 
 def add_log(state: dict, msg: str, max_entries: int = 50) -> None:
@@ -82,3 +100,31 @@ def apply_result(state: dict, coin: str, base_bet: float, max_bet: float,
         "winner": winner,
     })
     cs["history"] = cs["history"][:20]
+
+
+def apply_follower_result(state: dict, coin: str, slug: str,
+                          bet: float, won: bool, direction: str) -> None:
+    """Update Follower state for one coin after resolution (no martingale doubling)."""
+    cs = state["coins"][coin]
+    fl = cs.setdefault("follower", _default_follower())
+
+    result_str        = "win" if won else "loss"
+    fl["last_result"]    = result_str
+    fl["last_direction"] = direction
+    fl["last_slug"]      = slug
+    fl["total_spent"]   += bet
+
+    if won:
+        fl["wins"] += 1
+        add_log(state, f"[{coin.upper()}] FOLLOWER ✅ WIN   dir={direction}  bet=${bet:.2f}")
+    else:
+        fl["losses"] += 1
+        add_log(state, f"[{coin.upper()}] FOLLOWER ❌ LOSS  dir={direction}  bet=${bet:.2f}")
+
+    fl["history"].insert(0, {
+        "slug":      slug,
+        "bet":       bet,
+        "result":    result_str,
+        "direction": direction,
+    })
+    fl["history"] = fl["history"][:20]
