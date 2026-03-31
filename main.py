@@ -272,12 +272,19 @@ def fetch_all_markets_both(ts: int) -> list[dict]:
 # CLOB helpers
 # ---------------------------------------------------------------------------
 
-def get_live_price(token_id: str) -> Optional[float]:
-    """Fetch current BUY price from the CLOB order book."""
-    url  = f"{HOST}/price?token_id={token_id}&side=BUY"
-    data = _curl_get(url)
-    raw  = data.get("price")
-    return float(raw) if raw is not None else None
+def get_live_price(token_id: str, max_attempts: int = 3) -> Optional[float]:
+    """Fetch current BUY price from the CLOB order book, with retry."""
+    url = f"{HOST}/price?token_id={token_id}&side=BUY"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            data = _curl_get(url)
+            raw  = data.get("price")
+            return float(raw) if raw is not None else None
+        except Exception as exc:
+            if attempt < max_attempts:
+                time.sleep(2)
+            else:
+                raise
 
 
 def build_client(max_attempts: int = 3, delay: int = 5) -> ClobClient:
@@ -391,54 +398,73 @@ def sign_follower_order(client: ClobClient, market_both: dict,
 
 
 # ---------------------------------------------------------------------------
-# Resolution — shared Chainlink close price for both strategies
+# Resolution — Martingale via Chainlink, Follower via Polymarket outcome
 # ---------------------------------------------------------------------------
 
-def resolve_by_chainlink(app_state: dict, ts: int,
-                         martingale_coins: list[str],
-                         follower_coins: dict[str, str]) -> None:
+def resolve_martingale(app_state: dict, ts: int, coins: list[str]) -> None:
     """
-    Fetch closing price once per coin, resolve both strategies.
-    martingale_coins: list of coins martingale placed a bet on.
-    follower_coins:   {coin: direction_chosen} for follower bets.
+    Fetch Chainlink closing price at xx:04:59, compare with price_to_beat.
+    Only called when martingale placed bets.
     """
-    all_coins = set(martingale_coins) | set(follower_coins.keys())
-    print(f"\n[Resolution] Fetching closing prices from Chainlink …")
-
-    for coin in all_coins:
+    print(f"\n[Martingale Resolution] Fetching Chainlink closing prices …")
+    slug = f"{{coin}}-updown-5m-{ts}"
+    for coin in coins:
         cs            = app_state["coins"].get(coin, {})
         price_to_beat = cs.get("price_to_beat")
         close_price   = get_chainlink_price(coin)
-        slug          = f"{coin}-updown-5m-{ts}"
 
         if close_price is None:
-            print(f"  [{coin.upper()}] No close price — skipping resolution")
+            print(f"  [{coin.upper()}] No close price — skipping")
             continue
         cs["close_price"] = close_price
 
         if price_to_beat is None:
-            print(f"  [{coin.upper()}] No price_to_beat — skipping resolution")
+            print(f"  [{coin.upper()}] No price_to_beat — skipping")
             continue
 
-        # Martingale resolution
-        if coin in martingale_coins:
-            bet = cs.get("current_bet", BASE_BET)
-            won = (close_price >= price_to_beat if DIRECTION.lower() == "up"
-                   else close_price < price_to_beat)
-            print(f"  [{coin.upper()}] MARTINGALE {'WIN' if won else 'LOSS'}"
-                  f"  open={price_to_beat:,.4f}  close={close_price:,.4f}  dir={DIRECTION}")
-            st.apply_result(app_state, coin, BASE_BET, MAX_BET, slug, bet, won,
-                            DIRECTION if won else ("Down" if DIRECTION == "Up" else "Up"))
+        bet = cs.get("current_bet", BASE_BET)
+        won = (close_price >= price_to_beat if DIRECTION.lower() == "up"
+               else close_price < price_to_beat)
+        print(f"  [{coin.upper()}] {'WIN' if won else 'LOSS'}"
+              f"  open={price_to_beat:,.4f}  close={close_price:,.4f}  dir={DIRECTION}")
+        st.apply_result(app_state, coin, BASE_BET, MAX_BET,
+                        f"{coin}-updown-5m-{ts}", bet, won,
+                        DIRECTION if won else ("Down" if DIRECTION == "Up" else "Up"))
+    st.save(app_state)
 
-        # Follower resolution
-        if coin in follower_coins:
-            direction = follower_coins[coin]
-            won = (close_price >= price_to_beat if direction.lower() == "up"
-                   else close_price < price_to_beat)
-            print(f"  [{coin.upper()}] FOLLOWER {'WIN' if won else 'LOSS'}"
-                  f"  open={price_to_beat:,.4f}  close={close_price:,.4f}  dir={direction}")
-            st.apply_follower_result(app_state, coin, slug, FOLLOWER_BET, won, direction)
 
+def _polymarket_outcome(coin: str, ts: int) -> Optional[str]:
+    """Single Polymarket fetch — returns winning outcome string or None."""
+    url = f"{GAMMA_API}/events/slug/{coin}-updown-5m-{ts}"
+    try:
+        event    = _curl_get(url)
+        market   = (event.get("markets") or [{}])[0]
+        prices   = json.loads(market.get("outcomePrices", "[]"))
+        outcomes = json.loads(market.get("outcomes", "[]"))
+        for i, p in enumerate(prices):
+            if float(p) >= 0.99 and i < len(outcomes):
+                return outcomes[i]
+    except Exception as exc:
+        print(f"  [{coin.upper()}] Polymarket outcome fetch error: {exc}")
+    return None
+
+
+def resolve_follower(app_state: dict, ts: int, follower_coins: dict[str, str]) -> None:
+    """
+    Single Polymarket outcomePrices check at xx:05:01 — no retry loop.
+    follower_coins: {coin: direction_bet}
+    """
+    print(f"\n[Follower Resolution] Checking Polymarket outcomes …")
+    for coin, direction_bet in follower_coins.items():
+        outcome = _polymarket_outcome(coin, ts)
+        if outcome is None:
+            print(f"  [{coin.upper()}] Outcome not available yet — skipping")
+            continue
+        won = outcome.strip().lower() == direction_bet.lower()
+        print(f"  [{coin.upper()}] {'WIN' if won else 'LOSS'}"
+              f"  bought={direction_bet}  resolved={outcome}")
+        st.apply_follower_result(app_state, coin,
+                                 f"{coin}-updown-5m-{ts}", FOLLOWER_BET, won, direction_bet)
     st.save(app_state)
 
 
@@ -472,15 +498,18 @@ def run_martingale_cycle(client: ClobClient, app_state: dict,
     print(f"\n[Martingale P2] Signing {len(markets)} order(s) …")
     signed: list[tuple[str, PostOrdersArgs]] = []
     with ThreadPoolExecutor(max_workers=len(markets)) as pool:
-        futures = [
+        sign_futures = {
             pool.submit(sign_order, client, m,
-                        app_state["coins"].get(m["coin"], {}).get("current_bet", BASE_BET))
+                        app_state["coins"].get(m["coin"], {}).get("current_bet", BASE_BET)): m["coin"]
             for m in markets
-        ]
-        for f in futures:
-            r = f.result()
-            if r:
-                signed.append(r)
+        }
+        for f, coin in sign_futures.items():
+            try:
+                r = f.result()
+                if r:
+                    signed.append(r)
+            except Exception as exc:
+                print(f"  [{coin.upper()}] Martingale sign thread crashed: {exc}")
 
     if not signed:
         st.add_log(app_state, "Martingale: no orders signed — skipped")
@@ -531,14 +560,17 @@ def run_follower_cycle(client: ClobClient, app_state: dict,
     print(f"\n[Follower P2] Picking directions and signing …")
     signed: list[tuple[str, str, PostOrdersArgs]] = []
     with ThreadPoolExecutor(max_workers=len(markets_both)) as pool:
-        futures = [
-            pool.submit(sign_follower_order, client, m, FOLLOWER_BET)
+        sign_futures = {
+            pool.submit(sign_follower_order, client, m, FOLLOWER_BET): m["coin"]
             for m in markets_both
-        ]
-        for f in futures:
-            r = f.result()
-            if r:
-                signed.append(r)
+        }
+        for f, coin in sign_futures.items():
+            try:
+                r = f.result()
+                if r:
+                    signed.append(r)
+            except Exception as exc:
+                print(f"  [{coin.upper()}] Follower sign thread crashed: {exc}")
 
     if not signed:
         st.add_log(app_state, "Follower: no orders signed — skipped")
@@ -679,11 +711,13 @@ def main() -> None:
             print(f"\n[Timing] Window open {window_open.strftime('%H:%M:%S UTC')} in {wait_open:.1f}s")
             time.sleep(wait_open)
 
-        print(f"\n[Price to Beat] Fetching Chainlink at {window_open.strftime('%H:%M:%S UTC')} …")
-        for coin in COINS:
-            price = get_chainlink_price(coin)
-            if price is not None:
-                app_state.setdefault("coins", {}).setdefault(coin, {})["price_to_beat"] = price
+        # Chainlink price-to-beat only needed for Martingale resolution
+        if RUN_MARTINGALE:
+            print(f"\n[Price to Beat] Fetching Chainlink at {window_open.strftime('%H:%M:%S UTC')} …")
+            for coin in COINS:
+                price = get_chainlink_price(coin)
+                if price is not None:
+                    app_state.setdefault("coins", {}).setdefault(coin, {})["price_to_beat"] = price
 
         app_state.setdefault("bot", {}).update({
             "status":       "running",
@@ -719,16 +753,25 @@ def main() -> None:
                 time.sleep(wait_f)
             follower_coins = run_follower_cycle(client, app_state, ts)
 
-        # ── T+299: Close price + Resolution ─────────────────────────────────
-        if martingale_coins or follower_coins:
+        # ── T+299: Martingale resolution via Chainlink ──────────────────────
+        if martingale_coins:
             wait_r = (resolution_at - datetime.now(timezone.utc)).total_seconds()
             if wait_r > 0:
-                print(f"\n[Timing] Resolution {resolution_at.strftime('%H:%M:%S UTC')}"
-                      f" in {wait_r:.1f}s …")
+                print(f"\n[Timing] Martingale resolution in {wait_r:.1f}s …")
                 time.sleep(wait_r)
-            resolve_by_chainlink(app_state, ts, martingale_coins, follower_coins)
-        else:
-            # No bets placed; sleep until past window close to avoid re-triggering
+            resolve_martingale(app_state, ts, martingale_coins)
+
+        # ── T+301: Follower resolution via Polymarket outcome ────────────────
+        if follower_coins:
+            follower_resolve_at = window_open + timedelta(seconds=301)  # xx:05:01
+            wait_f = (follower_resolve_at - datetime.now(timezone.utc)).total_seconds()
+            if wait_f > 0:
+                print(f"\n[Timing] Follower resolution in {wait_f:.1f}s …")
+                time.sleep(wait_f)
+            resolve_follower(app_state, ts, follower_coins)
+
+        # ── Advance past window close if nothing was placed ──────────────────
+        if not martingale_coins and not follower_coins:
             wait_end = (resolution_at - datetime.now(timezone.utc)).total_seconds()
             if wait_end > 0:
                 time.sleep(wait_end)
