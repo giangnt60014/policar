@@ -433,39 +433,6 @@ def resolve_martingale(app_state: dict, ts: int, coins: list[str]) -> None:
     st.save(app_state)
 
 
-def _polymarket_outcome(coin: str, ts: int) -> Optional[str]:
-    """Single Polymarket fetch — returns winning outcome string or None."""
-    url = f"{GAMMA_API}/events/slug/{coin}-updown-5m-{ts}"
-    try:
-        event    = _curl_get(url)
-        market   = (event.get("markets") or [{}])[0]
-        prices   = json.loads(market.get("outcomePrices", "[]"))
-        outcomes = json.loads(market.get("outcomes", "[]"))
-        for i, p in enumerate(prices):
-            if float(p) >= 0.99 and i < len(outcomes):
-                return outcomes[i]
-    except Exception as exc:
-        print(f"  [{coin.upper()}] Polymarket outcome fetch error: {exc}")
-    return None
-
-
-def resolve_follower(app_state: dict, ts: int, follower_coins: dict[str, str]) -> None:
-    """
-    Single Polymarket outcomePrices check at xx:05:01 — no retry loop.
-    follower_coins: {coin: direction_bet}
-    """
-    print(f"\n[Follower Resolution] Checking Polymarket outcomes …")
-    for coin, direction_bet in follower_coins.items():
-        outcome = _polymarket_outcome(coin, ts)
-        if outcome is None:
-            print(f"  [{coin.upper()}] Outcome not available yet — skipping")
-            continue
-        won = outcome.strip().lower() == direction_bet.lower()
-        print(f"  [{coin.upper()}] {'WIN' if won else 'LOSS'}"
-              f"  bought={direction_bet}  resolved={outcome}")
-        st.apply_follower_result(app_state, coin,
-                                 f"{coin}-updown-5m-{ts}", FOLLOWER_BET, won, direction_bet)
-    st.save(app_state)
 
 
 # ---------------------------------------------------------------------------
@@ -761,14 +728,7 @@ def main() -> None:
                 time.sleep(wait_r)
             resolve_martingale(app_state, ts, martingale_coins)
 
-        # ── T+301: Follower resolution via Polymarket outcome ────────────────
-        if follower_coins:
-            follower_resolve_at = window_open + timedelta(seconds=301)  # xx:05:01
-            wait_f = (follower_resolve_at - datetime.now(timezone.utc)).total_seconds()
-            if wait_f > 0:
-                print(f"\n[Timing] Follower resolution in {wait_f:.1f}s …")
-                time.sleep(wait_f)
-            resolve_follower(app_state, ts, follower_coins)
+        # Follower: no resolution check — Polymarket pays out automatically.
 
         # ── Advance past window close if nothing was placed ──────────────────
         if not martingale_coins and not follower_coins:
