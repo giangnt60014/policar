@@ -560,26 +560,96 @@ def run_follower_cycle(client: ClobClient, app_state: dict,
 
 
 # ---------------------------------------------------------------------------
+# Interactive startup prompts
+# ---------------------------------------------------------------------------
+
+def _ask(prompt: str, default: str) -> str:
+    """Print prompt with default hint, return stripped input or default."""
+    try:
+        val = input(f"{prompt} [{default}]: ").strip()
+        return val if val else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit("Aborted.")
+
+
+def _ask_float(prompt: str, default: float, min_val: float = 1.0) -> float:
+    """Ask for a positive float, re-prompt on bad input."""
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            val = float(raw)
+            if val >= min_val:
+                return val
+            print(f"  Must be >= {min_val}. Try again.")
+        except ValueError:
+            print("  Invalid number. Try again.")
+
+
+def prompt_config() -> None:
+    """
+    Ask the user to choose strategy and bet sizes interactively.
+    Updates module-level globals so all downstream functions see the values.
+    """
+    global STRATEGY, FOLLOWER_BET, BASE_BET, MAX_BET, DIRECTION
+    global RUN_MARTINGALE, RUN_FOLLOWER
+
+    print("\n┌─ Strategy ──────────────────────────────────────────────┐")
+    print("│  1) Martingale — fixed direction, doubles bet on loss   │")
+    print("│  2) Follower   — buys market-favourite at xx:04:55      │")
+    print("│  3) Both       — run both strategies each window        │")
+    print("└─────────────────────────────────────────────────────────┘")
+
+    while True:
+        choice = _ask("Choice", "1").strip()
+        if choice in ("1", "2", "3"):
+            break
+        print("  Enter 1, 2 or 3.")
+
+    STRATEGY       = {"1": "martingale", "2": "follower", "3": "both"}[choice]
+    RUN_MARTINGALE = STRATEGY in ("martingale", "both")
+    RUN_FOLLOWER   = STRATEGY in ("follower",   "both")
+
+    if RUN_MARTINGALE:
+        print("\n── Martingale settings ───────────────────────────────────")
+        while True:
+            d = _ask("  Direction (Up / Down)", DIRECTION).strip().capitalize()
+            if d in ("Up", "Down"):
+                DIRECTION = d
+                break
+            print("  Enter Up or Down.")
+        BASE_BET = _ask_float("  Base bet (USDC)", BASE_BET)
+        MAX_BET  = _ask_float("  Max bet  (USDC)", MAX_BET, min_val=BASE_BET)
+
+    if RUN_FOLLOWER:
+        print("\n── Follower settings ─────────────────────────────────────")
+        FOLLOWER_BET = _ask_float("  Bet per round (USDC)", FOLLOWER_BET)
+
+    print("\n─── Configuration ────────────────────────────────────────")
+    print(f"  Strategy  : {STRATEGY.upper()}")
+    print(f"  Coins     : {', '.join(sorted(c.upper() for c in COINS))}")
+    if RUN_MARTINGALE:
+        print(f"  Martingale: {DIRECTION}  base=${BASE_BET}  max=${MAX_BET}")
+    if RUN_FOLLOWER:
+        print(f"  Follower  : ${FOLLOWER_BET} / round  (market-favourite)")
+    print("──────────────────────────────────────────────────────────\n")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     print("=== Policar — Polymarket 5-min Bot ===")
-    print(f"Strategy  : {STRATEGY.upper()}")
-    print(f"Coins     : {', '.join(sorted(c.upper() for c in COINS))}")
-    if RUN_MARTINGALE:
-        print(f"Martingale: direction={DIRECTION}  base=${BASE_BET}  max=${MAX_BET}")
-    if RUN_FOLLOWER:
-        print(f"Follower  : bet=${FOLLOWER_BET}  (buys market-favourite at xx:04:55)")
-    print(f"Funder    : {FUNDER}")
-    print()
+    print(f"Coins  : {', '.join(sorted(c.upper() for c in COINS))}")
+    print(f"Funder : {FUNDER}")
 
     if not PK:
         sys.exit("Error: PK not set in .env")
     if not FUNDER:
         sys.exit("Error: FUNDER not set in .env")
-    if not RUN_MARTINGALE and not RUN_FOLLOWER:
-        sys.exit(f"Error: STRATEGY={STRATEGY!r} is not valid. Use martingale, follower, or both.")
+
+    prompt_config()
 
     print("Initializing CLOB client …")
     client = build_client()
