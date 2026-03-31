@@ -183,6 +183,14 @@ function render(data) {
         <span class="result-badge ${resultClass}">${resultLabel}</span>
       </div>
       <div class="stat-row">
+        <span class="stat-label">Price to Beat</span>
+        <span class="stat-value">${cs.price_to_beat != null ? '$' + cs.price_to_beat.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '—'}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Close Price</span>
+        <span class="stat-value">${cs.close_price != null ? '$' + cs.close_price.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '—'}</span>
+      </div>
+      <div class="stat-row">
         <span class="stat-label">Next Bet</span>
         <span class="stat-value bet">$${(cs.current_bet || 0).toFixed(2)}</span>
       </div>
